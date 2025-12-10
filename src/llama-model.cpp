@@ -492,6 +492,25 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
 
+    switch (model.arch) {
+        case LLM_ARCH_FLUX:
+        case LLM_ARCH_SD1:
+        case LLM_ARCH_SDXL:
+        case LLM_ARCH_SD3:
+        case LLM_ARCH_AURA:
+        case LLM_ARCH_LTXV:
+        case LLM_ARCH_HYVID:
+        case LLM_ARCH_WAN:
+        case LLM_ARCH_HIDREAM:
+        case LLM_ARCH_COSMOS:
+        case LLM_ARCH_LUMINA2:
+            model.ftype = ml.ftype;
+            return;
+        default:
+            break;
+    }
+
+
     // everything past this point is not vocab-related
     // for CLIP models, we only need to load tensors, no hparams
     if (hparams.vocab_only || ml.get_arch() == LLM_ARCH_CLIP) {

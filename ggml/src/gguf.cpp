@@ -1132,6 +1132,14 @@ void gguf_add_tensor(
     ctx->info.push_back(ti);
 }
 
+void gguf_set_tensor_ndim(struct gguf_context * ctx, const char * name, const int n_dim) {
+    const int idx = gguf_find_tensor(ctx, name);
+    if (idx < 0) {
+        GGML_ABORT("tensor not found");
+    }
+    ctx->infos[idx].n_dims = n_dim;
+}
+
 void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggml_type type) {
     const int64_t tensor_id = gguf_find_tensor(ctx, name);
     if (tensor_id < 0) {
