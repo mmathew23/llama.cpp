@@ -18571,6 +18571,51 @@ static size_t llama_tensor_quantize_internal(enum ggml_type new_type, const floa
     return new_size;
 }
 
+static ggml_type get_upcast_type(ggml_type qtype) {
+    switch (qtype) {
+        case GGML_TYPE_Q2_K:    return GGML_TYPE_Q4_K;
+        case GGML_TYPE_Q3_K:    return GGML_TYPE_Q4_K;
+        case GGML_TYPE_Q4_K:    return GGML_TYPE_Q5_K;
+        case GGML_TYPE_Q5_K:    return GGML_TYPE_Q6_K;
+        default:               return qtype;
+    }
+}
+
+static bool should_upcast_layer(const std::string & name) {
+    // Skip norms and biases
+    if (name.find("norm") != std::string::npos || name.find("bias") != std::string::npos) {
+        return false;
+    }
+    // Must end with .weight
+    if (name.rfind(".weight") != name.size() - 7) {
+        return false;
+    }
+    
+    // Check double_blocks.{0,7}
+    if (name.find("double_blocks.") == 0) {
+        size_t dot = name.find('.', 14); // after "double_blocks."
+        if (dot != std::string::npos) {
+            std::string num = name.substr(14, dot - 14);
+            if (num == "0" || num == "7") {
+                return true;
+            }
+        }
+    }
+    
+    // Check single_blocks.{0,1,46,47}
+    if (name.find("single_blocks.") == 0) {
+        size_t dot = name.find('.', 14); // after "single_blocks."
+        if (dot != std::string::npos) {
+            std::string num = name.substr(14, dot - 14);
+            if (num == "0" || num == "1" || num == "46" || num == "47") {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
 static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     ggml_type default_type;
     llama_ftype ftype = params->ftype;
@@ -19067,6 +19112,15 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             if (params->output_tensor_type < GGML_TYPE_COUNT && strcmp(tensor->name, "output.weight") == 0) {
                 new_type = params->output_tensor_type;
             }
+            }
+	    // Upcast specific layers for K-quants
+	    {
+                ggml_type upcast = get_upcast_type(new_type);
+                if (upcast != new_type && should_upcast_layer(name)) {
+                    LLAMA_LOG_INFO("(upcast %s -> %s) ",
+                        ggml_type_name(new_type), ggml_type_name(upcast));
+                    new_type = upcast;
+                }
             }
 
             // If we've decided to quantize to the same type the tensor is already
