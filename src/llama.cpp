@@ -67,6 +67,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <functional>
@@ -18581,38 +18582,130 @@ static ggml_type get_upcast_type(ggml_type qtype) {
     }
 }
 
-static bool should_upcast_layer(const std::string & name) {
-    // Skip norms and biases
-    if (name.find("norm") != std::string::npos || name.find("bias") != std::string::npos) {
-        return false;
-    }
-    // Must end with .weight
-    if (name.rfind(".weight") != name.size() - 7) {
-        return false;
-    }
+enum class UpcastStyle {
+    Off      = 0,
+    Original = 1,  // single_blocks {0,1,46,47}
+    Extended = 2,  // single_blocks {2,6,10,29,44,45,46,47}
+};
+
+static UpcastStyle get_upcast_style() {
+    // Read & cache once
+    static UpcastStyle style = [] {
+        const char *v = std::getenv("UPCAST_STYLE");
+        if (!v || !*v) {
+            // default: behave like style 2 (your current logic)
+            return UpcastStyle::Extended;
+        }
+        switch (v[0]) {
+            case '0': return UpcastStyle::Off;
+            case '1': return UpcastStyle::Original;
+            case '2': return UpcastStyle::Extended;
+            default:  return UpcastStyle::Extended; // fallback
+        }
+    }();
+    return style;
+}
+
+// static bool should_upcast_layer(const std::string & name) {
+//     UpcastStyle style = get_upcast_style();
+//     if (style == UpcastStyle::Off) {
+//         return false;
+//     }
+//     // Skip norms and biases
+//     if (name.find("norm") != std::string::npos || name.find("bias") != std::string::npos) {
+//         return false;
+//     }
+//     // Must end with .weight
+//     if (name.rfind(".weight") != name.size() - 7) {
+//         return false;
+//     }
     
-    // Check double_blocks.{0,7}
-    if (name.find("double_blocks.") == 0) {
-        size_t dot = name.find('.', 14); // after "double_blocks."
+//     // Check double_blocks.{0,7}
+//     if (name.find("double_blocks.") == 0) {
+//         size_t dot = name.find('.', 14); // after "double_blocks."
+//         if (dot != std::string::npos) {
+//             std::string num = name.substr(14, dot - 14);
+//             if (num == "0" || num == "7") {
+//                 return true;
+//             }
+//         }
+//     }
+    
+//     // Check single_blocks.{0,1,46,47}
+//     if (name.find("single_blocks.") == 0) {
+//         size_t dot = name.find('.', 14); // after "single_blocks."
+//         if (dot != std::string::npos) {
+//             std::string num = name.substr(14, dot - 14);
+//             // if (num == "0" || num == "1" || num == "46" || num == "47") {
+//             if (num == "2" || num == "6" || num == "10" || num == "29" || num == "44" || num == "45" ||  num == "46" || num == "47") {
+//                 return true;
+//             }
+//         }
+//     }
+    
+//     return false;
+// }
+
+static bool should_upcast_layer(const std::string & name) {
+    UpcastStyle style = get_upcast_style();
+
+    // Style 0: completely disabled
+    if (style == UpcastStyle::Off) {
+        return false;
+    }
+
+    // Skip norms and biases
+    if (name.find("norm") != std::string::npos ||
+        name.find("bias") != std::string::npos) {
+        return false;
+    }
+
+    // Must end with ".weight"
+    if (name.size() < 7 || name.rfind(".weight") != name.size() - 7) {
+        return false;
+    }
+
+    // Helper constants for prefix length
+    constexpr const char *DOUBLE_PREFIX = "double_blocks.";
+    constexpr const char *SINGLE_PREFIX = "single_blocks.";
+    constexpr size_t DOUBLE_PREFIX_LEN  = 14; // strlen("double_blocks.");
+    constexpr size_t SINGLE_PREFIX_LEN  = 14; // strlen("single_blocks.");
+
+    // Check double_blocks.{0,7} (same for style 1 & 2)
+    if (name.compare(0, DOUBLE_PREFIX_LEN, DOUBLE_PREFIX) == 0) {
+        size_t dot = name.find('.', DOUBLE_PREFIX_LEN);
         if (dot != std::string::npos) {
-            std::string num = name.substr(14, dot - 14);
+            std::string num = name.substr(DOUBLE_PREFIX_LEN,
+                                          dot - DOUBLE_PREFIX_LEN);
             if (num == "0" || num == "7") {
                 return true;
             }
         }
     }
-    
-    // Check single_blocks.{0,1,46,47}
-    if (name.find("single_blocks.") == 0) {
-        size_t dot = name.find('.', 14); // after "single_blocks."
+
+    // Check single_blocks depending on UPCAST_STYLE
+    if (name.compare(0, SINGLE_PREFIX_LEN, SINGLE_PREFIX) == 0) {
+        size_t dot = name.find('.', SINGLE_PREFIX_LEN);
         if (dot != std::string::npos) {
-            std::string num = name.substr(14, dot - 14);
-            if (num == "0" || num == "1" || num == "46" || num == "47") {
-                return true;
+            std::string num = name.substr(SINGLE_PREFIX_LEN,
+                                          dot - SINGLE_PREFIX_LEN);
+
+            if (style == UpcastStyle::Original) {
+                // Commented-out logic:
+                // single_blocks.{0,1,46,47}
+                return (num == "0" || num == "1" ||
+                        num == "46" || num == "47");
+            } else { // UpcastStyle::Extended
+                // Current logic:
+                // single_blocks.{2,6,10,29,44,45,46,47}
+                return (num == "2"  || num == "6"  ||
+                        num == "10" || num == "29" ||
+                        num == "44" || num == "45" ||
+                        num == "46" || num == "47");
             }
         }
     }
-    
+
     return false;
 }
 
@@ -19114,9 +19207,9 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             }
             }
 	    // Upcast specific layers for K-quants
-	    {
-                ggml_type upcast = get_upcast_type(new_type);
-                if (upcast != new_type && should_upcast_layer(name)) {
+            {
+                ggml_type upcast = get_upcast_type(default_type);  // Use default_type, not new_type
+                if (upcast != default_type && should_upcast_layer(name)) {
                     LLAMA_LOG_INFO("(upcast %s -> %s) ",
                         ggml_type_name(new_type), ggml_type_name(upcast));
                     new_type = upcast;
