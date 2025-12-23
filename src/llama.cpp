@@ -18619,24 +18619,9 @@ static ggml_type get_upcast_type(ggml_type qtype) {
 #include <vector>
 #include <string>
 #include <sstream>
-
-// Configuration for a block type
-struct BlockUpcastConfig {
-    std::string prefix;      // e.g., "single_blocks.", "double_blocks."
-    int first_n = 2;         // upcast first N layers
-    int last_n = 2;          // upcast last N layers
-    int last_idx = -1;       // discovered last index (set during tensor scan)
-};
-
-// Global configuration
-struct UpcastConfig {
-    bool enabled = true;
-    std::vector<BlockUpcastConfig> blocks;
-    bool user_override = false;  // true if user provided UPCAST_BLOCKS
-};
-
-static UpcastConfig g_upcast_config;
-static std::atomic<bool> g_upcast_config_parsed{false};
+#include <unordered_map>
+#include <unordered_set>
+#include <cctype>
 
 static bool parse_index_after_prefix(
     const std::string &name,
@@ -18657,36 +18642,244 @@ static bool parse_index_after_prefix(
     return true;
 }
 
-// Parse format: "prefix:first:last" e.g., "single_blocks:2:2" or "double_blocks:1:1"
-static bool parse_block_spec(const std::string& spec, BlockUpcastConfig& out) {
-    std::istringstream ss(spec);
+// Parse ggml_type from string (e.g., "Q4_K" -> GGML_TYPE_Q4_K)
+static ggml_type parse_ggml_type(const std::string& s) {
+    // Normalize: uppercase
+    std::string normalized;
+    normalized.reserve(s.size());
+    for (char c : s) normalized += (char)std::toupper((unsigned char)c);
+
+    // Strip common prefixes
+    const char* prefix = "GGML_TYPE_";
+    if (normalized.rfind(prefix, 0) == 0) {
+        normalized = normalized.substr(std::strlen(prefix));
+    }
+
+    // Map strings to types
+    if (normalized == "Q2_K")  return GGML_TYPE_Q2_K;
+    if (normalized == "Q3_K")  return GGML_TYPE_Q3_K;
+    if (normalized == "Q4_K")  return GGML_TYPE_Q4_K;
+    if (normalized == "Q5_K")  return GGML_TYPE_Q5_K;
+    if (normalized == "Q6_K")  return GGML_TYPE_Q6_K;
+    if (normalized == "Q4_0")  return GGML_TYPE_Q4_0;
+    if (normalized == "Q4_1")  return GGML_TYPE_Q4_1;
+    if (normalized == "Q5_0")  return GGML_TYPE_Q5_0;
+    if (normalized == "Q5_1")  return GGML_TYPE_Q5_1;
+    if (normalized == "Q8_0")  return GGML_TYPE_Q8_0;
+    if (normalized == "F16")   return GGML_TYPE_F16;
+    if (normalized == "BF16")  return GGML_TYPE_BF16;
+    if (normalized == "F32")   return GGML_TYPE_F32;
+
+    return GGML_TYPE_COUNT; // Invalid/not found
+}
+
+// Parse a list of integers: "0,5,10-15,47" -> {0, 5, 10, 11, 12, 13, 14, 15, 47}
+static std::unordered_set<int> parse_index_list(const std::string& s) {
+    std::unordered_set<int> result;
+    std::istringstream ss(s);
+    std::string token;
+
+    while (std::getline(ss, token, ',')) {
+        // Trim whitespace
+        size_t start = token.find_first_not_of(" \t");
+        size_t end = token.find_last_not_of(" \t");
+        if (start == std::string::npos) continue;
+        token = token.substr(start, end - start + 1);
+
+        // Check for range syntax: "5-10"
+        size_t dash = token.find('-');
+        if (dash != std::string::npos && dash > 0 && dash < token.size() - 1) {
+            std::string left = token.substr(0, dash);
+            std::string right = token.substr(dash + 1);
+
+            bool left_valid = !left.empty();
+            bool right_valid = !right.empty();
+            for (char c : left) if (c < '0' || c > '9') left_valid = false;
+            for (char c : right) if (c < '0' || c > '9') right_valid = false;
+
+            if (left_valid && right_valid) {
+                int range_start = std::stoi(left);
+                int range_end = std::stoi(right);
+                for (int i = range_start; i <= range_end; ++i) {
+                    result.insert(i);
+                }
+                continue;
+            }
+        }
+
+        // Single index
+        bool valid = !token.empty();
+        for (char c : token) if (c < '0' || c > '9') valid = false;
+        if (valid) {
+            result.insert(std::stoi(token));
+        }
+    }
+    return result;
+}
+
+// Extended upcast rule supporting exact keys, specific indices, and custom types
+struct UpcastRule {
+    enum class Type {
+        ExactKey,       // Match exact tensor name
+        BlockIndices,   // Match specific block indices
+        BlockFirstLast  // Match first N / last N blocks (original behavior)
+    };
+
+    Type rule_type = Type::BlockFirstLast;
+    std::string pattern;                    // Exact key or block prefix
+    std::unordered_set<int> indices;        // For BlockIndices: specific indices
+    int first_n = 0;                        // For BlockFirstLast
+    int last_n = 0;                         // For BlockFirstLast
+    int last_idx = -1;                      // Discovered last index (for BlockFirstLast)
+    ggml_type target_type = GGML_TYPE_COUNT; // COUNT = use default upcast logic
+};
+
+// Global configuration
+struct UpcastConfig {
+    bool enabled = true;
+    std::vector<UpcastRule> rules;
+    std::unordered_map<std::string, ggml_type> exact_keys; // Fast lookup for exact matches
+    bool user_override = false;
+};
+
+static UpcastConfig g_upcast_config;
+static std::atomic<bool> g_upcast_config_parsed{false};
+
+// Parse extended format:
+//   "exact.tensor.name=Q6_K"           -> ExactKey with target type
+//   "single_blocks[0,5,10,47]=Q5_K"    -> BlockIndices with specific indices and type
+//   "single_blocks[0,5,10,47]"         -> BlockIndices with default upcast
+//   "single_blocks:2:2:Q6_K"           -> BlockFirstLast with type
+//   "single_blocks:2:2"                -> BlockFirstLast with default upcast (backward compat)
+//   "single_blocks"                    -> BlockFirstLast with defaults (first=2, last=2)
+static bool parse_upcast_rule(const std::string& spec, UpcastRule& out) {
+    out = UpcastRule{}; // Reset
+
+    std::string trimmed = spec;
+    // Trim whitespace
+    size_t start = trimmed.find_first_not_of(" \t");
+    size_t end = trimmed.find_last_not_of(" \t");
+    if (start == std::string::npos) return false;
+    trimmed = trimmed.substr(start, end - start + 1);
+
+    // Check for exact key format: "some.tensor.name=TYPE"
+    size_t eq_pos = trimmed.find('=');
+    size_t bracket_pos = trimmed.find('[');
+
+    if (eq_pos != std::string::npos && (bracket_pos == std::string::npos || eq_pos < bracket_pos)) {
+        std::string key_part = trimmed.substr(0, eq_pos);
+        std::string type_part = trimmed.substr(eq_pos + 1);
+
+        // Trim both parts
+        start = key_part.find_first_not_of(" \t");
+        end = key_part.find_last_not_of(" \t");
+        if (start != std::string::npos) key_part = key_part.substr(start, end - start + 1);
+
+        start = type_part.find_first_not_of(" \t");
+        end = type_part.find_last_not_of(" \t");
+        if (start != std::string::npos) type_part = type_part.substr(start, end - start + 1);
+
+        // Check if this looks like an exact tensor key
+        if (key_part.find('[') == std::string::npos &&
+            (key_part.rfind(".weight") == key_part.size() - 7 ||
+             key_part.rfind(".bias") == key_part.size() - 5 ||
+             std::count(key_part.begin(), key_part.end(), '.') >= 2)) {
+            // Exact key match
+            out.rule_type = UpcastRule::Type::ExactKey;
+            out.pattern = key_part;
+            out.target_type = parse_ggml_type(type_part);
+            return !out.pattern.empty();
+        }
+    }
+
+    // Check for block indices format: "prefix[indices]=TYPE" or "prefix[indices]"
+    if (bracket_pos != std::string::npos) {
+        size_t close_bracket = trimmed.find(']', bracket_pos);
+        if (close_bracket == std::string::npos) return false;
+
+        out.rule_type = UpcastRule::Type::BlockIndices;
+        out.pattern = trimmed.substr(0, bracket_pos);
+
+        // Ensure prefix ends with '.'
+        if (!out.pattern.empty() && out.pattern.back() != '.') {
+            out.pattern += '.';
+        }
+
+        // Parse indices
+        std::string indices_str = trimmed.substr(bracket_pos + 1, close_bracket - bracket_pos - 1);
+        out.indices = parse_index_list(indices_str);
+
+        // Check for type after ']'
+        if (close_bracket + 1 < trimmed.size()) {
+            std::string remainder = trimmed.substr(close_bracket + 1);
+            if (!remainder.empty() && remainder[0] == '=') {
+                std::string type_str = remainder.substr(1);
+                start = type_str.find_first_not_of(" \t");
+                end = type_str.find_last_not_of(" \t");
+                if (start != std::string::npos) {
+                    type_str = type_str.substr(start, end - start + 1);
+                    out.target_type = parse_ggml_type(type_str);
+                }
+            }
+        }
+
+        return !out.pattern.empty() && !out.indices.empty();
+    }
+
+    // BlockFirstLast format: "prefix:first:last:type" or "prefix:first:last" or "prefix"
+    out.rule_type = UpcastRule::Type::BlockFirstLast;
+
+    std::istringstream ss(trimmed);
     std::string token;
     std::vector<std::string> parts;
 
     while (std::getline(ss, token, ':')) {
-        size_t start = token.find_first_not_of(" \t");
-        size_t end = token.find_last_not_of(" \t");
+        start = token.find_first_not_of(" \t");
+        end = token.find_last_not_of(" \t");
         if (start != std::string::npos) {
             parts.push_back(token.substr(start, end - start + 1));
         }
     }
 
-    if (parts.empty() || parts.size() > 3) return false;
+    if (parts.empty()) return false;
 
-    out.prefix = parts[0];
-    if (!out.prefix.empty() && out.prefix.back() != '.') {
-        out.prefix += '.';
+    out.pattern = parts[0];
+    if (!out.pattern.empty() && out.pattern.back() != '.') {
+        out.pattern += '.';
     }
 
-    out.first_n = (parts.size() >= 2) ? std::stoi(parts[1]) : 2;
-    out.last_n = (parts.size() >= 3) ? std::stoi(parts[2]) : 2;
-    out.last_idx = -1;
+    // Parse remaining parts
+    for (size_t i = 1; i < parts.size(); ++i) {
+        // Try to parse as type first
+        ggml_type maybe_type = parse_ggml_type(parts[i]);
+        if (maybe_type != GGML_TYPE_COUNT) {
+            out.target_type = maybe_type;
+        } else {
+            // Try to parse as number
+            bool is_num = !parts[i].empty();
+            for (char c : parts[i]) if (c < '0' || c > '9') is_num = false;
+
+            if (is_num) {
+                int val = std::stoi(parts[i]);
+                if (out.first_n == 0) {
+                    out.first_n = val;
+                } else {
+                    out.last_n = val;
+                }
+            }
+        }
+    }
+
+    // Defaults if not specified
+    if (out.first_n == 0 && out.last_n == 0) {
+        out.first_n = 2;
+        out.last_n = 2;
+    }
 
     return true;
 }
 
-// Parse UPCAST_BLOCKS env var
-// Format: "single_blocks:2:2,double_blocks:1:1" or just "single_blocks,double_blocks"
+// Parse UPCAST_BLOCKS env var with extended format
 static void parse_upcast_env() {
     if (g_upcast_config_parsed.exchange(true)) return;
 
@@ -18703,12 +18896,32 @@ static void parse_upcast_env() {
     if (blocks_env && *blocks_env) {
         g_upcast_config.user_override = true;
 
-        std::istringstream ss(blocks_env);
-        std::string spec;
-        while (std::getline(ss, spec, ',')) {
-            BlockUpcastConfig block;
-            if (parse_block_spec(spec, block)) {
-                g_upcast_config.blocks.push_back(block);
+        // Split by comma, but be careful with brackets
+        std::string env_str = blocks_env;
+        std::vector<std::string> specs;
+
+        int bracket_depth = 0;
+        size_t spec_start = 0;
+        for (size_t i = 0; i <= env_str.size(); ++i) {
+            char c = (i < env_str.size()) ? env_str[i] : ',';
+            if (c == '[') bracket_depth++;
+            else if (c == ']') bracket_depth--;
+            else if (c == ',' && bracket_depth == 0) {
+                if (i > spec_start) {
+                    specs.push_back(env_str.substr(spec_start, i - spec_start));
+                }
+                spec_start = i + 1;
+            }
+        }
+
+        for (const auto& spec : specs) {
+            UpcastRule rule;
+            if (parse_upcast_rule(spec, rule)) {
+                // For exact keys, also add to fast lookup map
+                if (rule.rule_type == UpcastRule::Type::ExactKey) {
+                    g_upcast_config.exact_keys[rule.pattern] = rule.target_type;
+                }
+                g_upcast_config.rules.push_back(std::move(rule));
             }
         }
     }
@@ -18720,13 +18933,15 @@ static UpcastConfig& get_upcast_config() {
 }
 
 // Update last indices after scanning tensors
-static void update_block_last_indices(const std::string& name) {
+static void update_rule_last_indices(const std::string& name) {
     UpcastConfig& config = get_upcast_config();
 
-    for (auto& block : config.blocks) {
+    for (auto& rule : config.rules) {
+        if (rule.rule_type != UpcastRule::Type::BlockFirstLast) continue;
+
         int idx = -1;
-        if (parse_index_after_prefix(name, block.prefix.c_str(), block.prefix.size(), idx)) {
-            block.last_idx = std::max(block.last_idx, idx);
+        if (parse_index_after_prefix(name, rule.pattern.c_str(), rule.pattern.size(), idx)) {
+            rule.last_idx = std::max(rule.last_idx, idx);
         }
     }
 }
@@ -18776,37 +18991,85 @@ static UpcastCounts get_upcast_counts() {
     return UpcastCounts{7, 47, 51};
 }
 
+// Result of upcast check - contains both whether to upcast and what type
+struct UpcastResult {
+    bool should_upcast = false;
+    ggml_type target_type = GGML_TYPE_COUNT; // COUNT means use default upcast logic
+};
+
 // Check if layer should be upcast using new config system
-static bool should_upcast_layer_user(const std::string& name) {
+static UpcastResult check_upcast_user(const std::string& name) {
+    UpcastResult result;
     const UpcastConfig& config = get_upcast_config();
 
-    if (!config.enabled || config.blocks.empty()) return false;
+    if (!config.enabled || config.rules.empty()) return result;
 
     // Skip norms and biases
     if (name.find("norm") != std::string::npos ||
         name.find("bias") != std::string::npos) {
-        return false;
+        return result;
     }
 
-    // Must end with ".weight"
-    if (name.size() < 7 || name.rfind(".weight") != name.size() - 7) {
-        return false;
+    // Must end with ".weight" (for block rules, not exact keys)
+    bool ends_with_weight = (name.size() >= 7 && name.rfind(".weight") == name.size() - 7);
+
+    // Check exact key match first (fast path)
+    auto exact_it = config.exact_keys.find(name);
+    if (exact_it != config.exact_keys.end()) {
+        result.should_upcast = true;
+        result.target_type = exact_it->second;
+        return result;
     }
 
-    for (const auto& block : config.blocks) {
-        int idx = -1;
-        if (parse_index_after_prefix(name, block.prefix.c_str(), block.prefix.size(), idx)) {
-            const int last = block.last_idx;
-            if (last < 0) return false;
+    // Check rules in order (first match wins)
+    for (const auto& rule : config.rules) {
+        switch (rule.rule_type) {
+            case UpcastRule::Type::ExactKey:
+                // Already checked via exact_keys map
+                if (rule.pattern == name) {
+                    result.should_upcast = true;
+                    result.target_type = rule.target_type;
+                    return result;
+                }
+                break;
 
-            bool in_first = (idx < block.first_n);
-            bool in_last = (idx > last - block.last_n);
+            case UpcastRule::Type::BlockIndices: {
+                if (!ends_with_weight) break;
 
-            return (in_first || in_last);
+                int idx = -1;
+                if (parse_index_after_prefix(name, rule.pattern.c_str(), rule.pattern.size(), idx)) {
+                    if (rule.indices.count(idx) > 0) {
+                        result.should_upcast = true;
+                        result.target_type = rule.target_type;
+                        return result;
+                    }
+                }
+                break;
+            }
+
+            case UpcastRule::Type::BlockFirstLast: {
+                if (!ends_with_weight) break;
+
+                int idx = -1;
+                if (parse_index_after_prefix(name, rule.pattern.c_str(), rule.pattern.size(), idx)) {
+                    const int last = rule.last_idx;
+                    if (last < 0) break;
+
+                    bool in_first = (idx < rule.first_n);
+                    bool in_last = (idx > last - rule.last_n);
+
+                    if (in_first || in_last) {
+                        result.should_upcast = true;
+                        result.target_type = rule.target_type;
+                        return result;
+                    }
+                }
+                break;
+            }
         }
     }
 
-    return false;
+    return result;
 }
 
 // Legacy logic for backward compatibility
@@ -18865,19 +19128,27 @@ static bool should_upcast_layer_legacy(const std::string& name) {
     return false;
 }
 
-// Main entry point
-static bool should_upcast_layer(const std::string& name) {
+// Main entry point - returns both whether to upcast and the target type
+static UpcastResult get_upcast_result(const std::string& name) {
+    UpcastResult result;
     const UpcastConfig& config = get_upcast_config();
 
-    if (!config.enabled) return false;
+    if (!config.enabled) return result;
 
     // If user provided UPCAST_BLOCKS, use new system exclusively
     if (config.user_override) {
-        return should_upcast_layer_user(name);
+        return check_upcast_user(name);
     }
 
-    // Otherwise, fall back to legacy logic
-    return should_upcast_layer_legacy(name);
+    // Otherwise, fall back to legacy logic (which uses default upcast type)
+    result.should_upcast = should_upcast_layer_legacy(name);
+    result.target_type = GGML_TYPE_COUNT; // Use default upcast mapping
+    return result;
+}
+
+// Backward compatible wrapper
+static bool should_upcast_layer(const std::string& name) {
+    return get_upcast_result(name).should_upcast;
 }
 
 static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
@@ -19032,26 +19303,37 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
 
         // Update user-defined block indices
-        update_block_last_indices(name);
+        update_rule_last_indices(name);
     }
 
     // Cache legacy counts
     set_upcast_counts(inferred);
-
     // Log configuration
-    const UpcastConfig& upcast_cfg = get_upcast_config();
-    if (upcast_cfg.user_override) {
-        LLAMA_LOG_INFO("Upcast user-defined blocks:\n");
-        for (const auto& block : upcast_cfg.blocks) {
-            LLAMA_LOG_INFO("  %s first=%d last=%d (last_idx=%d)\n",
-                block.prefix.c_str(), block.first_n, block.last_n, block.last_idx);
-        }
-    } else {
-        LLAMA_LOG_INFO("Upcast legacy mode (UPCAST_STYLE=%d): double=%d single=%d transformer=%d\n",
-            (int)get_upcast_style(), inferred.double_last, inferred.single_last, inferred.transformer_last);
-    }
+	const UpcastConfig& upcast_cfg = get_upcast_config();
+	if (upcast_cfg.user_override) {
+	    LLAMA_LOG_INFO("Upcast user-defined rules:\n");
+	    for (const auto& rule : upcast_cfg.rules) {
+		const char* type_str = (rule.target_type != GGML_TYPE_COUNT)
+		    ? ggml_type_name(rule.target_type) : "default";
 
-
+		switch (rule.rule_type) {
+		    case UpcastRule::Type::ExactKey:
+			LLAMA_LOG_INFO("  exact: %s -> %s\n", rule.pattern.c_str(), type_str);
+			break;
+		    case UpcastRule::Type::BlockIndices:
+			LLAMA_LOG_INFO("  indices: %s [%zu indices] -> %s\n",
+			    rule.pattern.c_str(), rule.indices.size(), type_str);
+			break;
+		    case UpcastRule::Type::BlockFirstLast:
+			LLAMA_LOG_INFO("  first/last: %s first=%d last=%d (last_idx=%d) -> %s\n",
+			    rule.pattern.c_str(), rule.first_n, rule.last_n, rule.last_idx, type_str);
+			break;
+		}
+	    }
+	} else {
+	    LLAMA_LOG_INFO("Upcast legacy mode (UPCAST_STYLE=%d): double=%d single=%d transformer=%d\n",
+		(int)get_upcast_style(), inferred.double_last, inferred.single_last, inferred.transformer_last);
+	}
 
     qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)model.hparams.n_layer;
 
@@ -19412,18 +19694,30 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             }
 
             // Upcast specific layers for K-quants (but never downgrade a better per-tensor choice)
-            {
-                if (should_upcast_layer(name) && is_k_quant(default_type) && is_k_quant(new_type)) {
-                    const ggml_type upcast_candidate = get_upcast_type(default_type); // e.g. Q4_K -> Q5_K
-                    const ggml_type final_type = k_quant_max(new_type, upcast_candidate); // keep Q6_K if already chosen
+	    {
+		UpcastResult upcast = get_upcast_result(name);
 
-                    if (final_type != new_type) {
-                        LLAMA_LOG_INFO("(upcast %s -> %s) ",
-                            ggml_type_name(new_type), ggml_type_name(final_type));
-                        new_type = final_type;
-                    }
-                }
-            }
+		if (upcast.should_upcast) {
+		    ggml_type final_type;
+
+		    if (upcast.target_type != GGML_TYPE_COUNT) {
+			// User specified exact type
+			final_type = upcast.target_type;
+		    } else if (is_k_quant(default_type) && is_k_quant(new_type)) {
+			// Use default upcast logic
+			const ggml_type upcast_candidate = get_upcast_type(default_type);
+			final_type = k_quant_max(new_type, upcast_candidate);
+		    } else {
+			final_type = new_type;
+		    }
+
+		    if (final_type != new_type) {
+			LLAMA_LOG_INFO("(upcast %s -> %s) ",
+			    ggml_type_name(new_type), ggml_type_name(final_type));
+			new_type = final_type;
+		    }
+		}
+	    }
 
             
             // If we've decided to quantize to the same type the tensor is already
