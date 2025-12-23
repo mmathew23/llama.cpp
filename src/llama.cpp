@@ -18614,86 +18614,29 @@ static ggml_type get_upcast_type(ggml_type qtype) {
     }
 }
 
-
-enum class UpcastStyle {
-    Off       = 0,
-    Original  = 1,  // single_blocks {0,1,46,47}
-    Extended  = 2,  // single_blocks {2,6,10,29,44,45,46,47}
-    FirstLast = 3,  // double: {0,last} ; single: {0,1,last-1,last} ; transformer: {0,1,last-1,last}
-};
-
-static UpcastStyle get_upcast_style() {
-    static UpcastStyle style = [] {
-        const char *v = std::getenv("UPCAST_STYLE");
-        if (!v || !*v) return UpcastStyle::Extended; // default (your current behavior)
-        switch (v[0]) {
-            case '0': return UpcastStyle::Off;
-            case '1': return UpcastStyle::Original;
-            case '2': return UpcastStyle::Extended;
-            case '3': return UpcastStyle::FirstLast;
-            default:  return UpcastStyle::Extended;
-        }
-    }();
-    return style;
-}
-
 #include <atomic>
 #include <algorithm>
+#include <vector>
+#include <string>
+#include <sstream>
 
-// last indices (NOT counts)
-struct UpcastCounts {
-    int double_last      = -1;
-    int single_last      = -1;
-    int transformer_last = -1;
+// Configuration for a block type
+struct BlockUpcastConfig {
+    std::string prefix;      // e.g., "single_blocks.", "double_blocks."
+    int first_n = 2;         // upcast first N layers
+    int last_n = 2;          // upcast last N layers
+    int last_idx = -1;       // discovered last index (set during tensor scan)
 };
 
-static std::atomic<bool> g_upcast_counts_set{false};
-static UpcastCounts g_upcast_counts;
+// Global configuration
+struct UpcastConfig {
+    bool enabled = true;
+    std::vector<BlockUpcastConfig> blocks;
+    bool user_override = false;  // true if user provided UPCAST_BLOCKS
+};
 
-static void set_upcast_counts(const UpcastCounts & c) {
-    g_upcast_counts = c;
-    g_upcast_counts_set.store(true, std::memory_order_release);
-}
-
-static UpcastCounts get_upcast_counts_fallback() {
-    // sensible defaults if inference fails (keeps behavior predictable)
-    return UpcastCounts{
-        /*double_last=*/7,   // 0..7
-        /*single_last=*/47,  // 0..47
-        /*transformer_last=*/51 // 0..51
-    };
-}
-
-static UpcastCounts get_upcast_counts() {
-    // optional env override still allowed (but not required)
-    auto getenv_int = [](const char *key) -> int {
-        const char *v = std::getenv(key);
-        if (!v || !*v) return -1;
-        char *end = nullptr;
-        long x = std::strtol(v, &end, 10);
-        if (end == v || x <= 0) return -1;
-        return (int)x;
-    };
-
-    // If user sets COUNTs explicitly, honor them
-    const int dbl_cnt = getenv_int("UPCAST_DOUBLE_COUNT");
-    const int sgl_cnt = getenv_int("UPCAST_SINGLE_COUNT");
-    const int trf_cnt = getenv_int("UPCAST_TRANSFORMER_COUNT");
-    if (dbl_cnt > 0 || sgl_cnt > 0 || trf_cnt > 0) {
-        UpcastCounts c = get_upcast_counts_fallback();
-        if (dbl_cnt > 0) c.double_last = std::max(0, dbl_cnt - 1);
-        if (sgl_cnt > 0) c.single_last = std::max(0, sgl_cnt - 1);
-        if (trf_cnt > 0) c.transformer_last = std::max(0, trf_cnt - 1);
-        return c;
-    }
-
-    // Otherwise use inferred values if set
-    if (g_upcast_counts_set.load(std::memory_order_acquire)) {
-        return g_upcast_counts;
-    }
-
-    return get_upcast_counts_fallback();
-}
+static UpcastConfig g_upcast_config;
+static std::atomic<bool> g_upcast_config_parsed{false};
 
 static bool parse_index_after_prefix(
     const std::string &name,
@@ -18714,10 +18657,130 @@ static bool parse_index_after_prefix(
     return true;
 }
 
+// Parse format: "prefix:first:last" e.g., "single_blocks:2:2" or "double_blocks:1:1"
+static bool parse_block_spec(const std::string& spec, BlockUpcastConfig& out) {
+    std::istringstream ss(spec);
+    std::string token;
+    std::vector<std::string> parts;
 
-static bool should_upcast_layer(const std::string &name) {
-    const UpcastStyle style = get_upcast_style();
-    if (style == UpcastStyle::Off) return false;
+    while (std::getline(ss, token, ':')) {
+        size_t start = token.find_first_not_of(" \t");
+        size_t end = token.find_last_not_of(" \t");
+        if (start != std::string::npos) {
+            parts.push_back(token.substr(start, end - start + 1));
+        }
+    }
+
+    if (parts.empty() || parts.size() > 3) return false;
+
+    out.prefix = parts[0];
+    if (!out.prefix.empty() && out.prefix.back() != '.') {
+        out.prefix += '.';
+    }
+
+    out.first_n = (parts.size() >= 2) ? std::stoi(parts[1]) : 2;
+    out.last_n = (parts.size() >= 3) ? std::stoi(parts[2]) : 2;
+    out.last_idx = -1;
+
+    return true;
+}
+
+// Parse UPCAST_BLOCKS env var
+// Format: "single_blocks:2:2,double_blocks:1:1" or just "single_blocks,double_blocks"
+static void parse_upcast_env() {
+    if (g_upcast_config_parsed.exchange(true)) return;
+
+    g_upcast_config.enabled = true;
+    g_upcast_config.user_override = false;
+
+    const char* off_env = std::getenv("UPCAST_OFF");
+    if (off_env && off_env[0] == '1') {
+        g_upcast_config.enabled = false;
+        return;
+    }
+
+    const char* blocks_env = std::getenv("UPCAST_BLOCKS");
+    if (blocks_env && *blocks_env) {
+        g_upcast_config.user_override = true;
+
+        std::istringstream ss(blocks_env);
+        std::string spec;
+        while (std::getline(ss, spec, ',')) {
+            BlockUpcastConfig block;
+            if (parse_block_spec(spec, block)) {
+                g_upcast_config.blocks.push_back(block);
+            }
+        }
+    }
+}
+
+static UpcastConfig& get_upcast_config() {
+    parse_upcast_env();
+    return g_upcast_config;
+}
+
+// Update last indices after scanning tensors
+static void update_block_last_indices(const std::string& name) {
+    UpcastConfig& config = get_upcast_config();
+
+    for (auto& block : config.blocks) {
+        int idx = -1;
+        if (parse_index_after_prefix(name, block.prefix.c_str(), block.prefix.size(), idx)) {
+            block.last_idx = std::max(block.last_idx, idx);
+        }
+    }
+}
+
+// Legacy upcast style enum (for backward compatibility)
+enum class UpcastStyle {
+    Off       = 0,
+    Original  = 1,
+    Extended  = 2,
+    FirstLast = 3,
+};
+
+static UpcastStyle get_upcast_style() {
+    static UpcastStyle style = [] {
+        const char *v = std::getenv("UPCAST_STYLE");
+        if (!v || !*v) return UpcastStyle::Extended;
+        switch (v[0]) {
+            case '0': return UpcastStyle::Off;
+            case '1': return UpcastStyle::Original;
+            case '2': return UpcastStyle::Extended;
+            case '3': return UpcastStyle::FirstLast;
+            default:  return UpcastStyle::Extended;
+        }
+    }();
+    return style;
+}
+
+// Legacy counts for backward compatibility
+struct UpcastCounts {
+    int double_last      = -1;
+    int single_last      = -1;
+    int transformer_last = -1;
+};
+
+static UpcastCounts g_upcast_counts;
+static std::atomic<bool> g_upcast_counts_set{false};
+
+static void set_upcast_counts(const UpcastCounts & c) {
+    g_upcast_counts = c;
+    g_upcast_counts_set.store(true, std::memory_order_release);
+}
+
+static UpcastCounts get_upcast_counts() {
+    if (g_upcast_counts_set.load(std::memory_order_acquire)) {
+        return g_upcast_counts;
+    }
+    return UpcastCounts{7, 47, 51};
+}
+
+// Check if layer should be upcast using new config system
+static bool should_upcast_layer_user(const std::string& name) {
+    const UpcastConfig& config = get_upcast_config();
+
+    if (!config.enabled || config.blocks.empty()) return false;
 
     // Skip norms and biases
     if (name.find("norm") != std::string::npos ||
@@ -18730,6 +18793,36 @@ static bool should_upcast_layer(const std::string &name) {
         return false;
     }
 
+    for (const auto& block : config.blocks) {
+        int idx = -1;
+        if (parse_index_after_prefix(name, block.prefix.c_str(), block.prefix.size(), idx)) {
+            const int last = block.last_idx;
+            if (last < 0) return false;
+
+            bool in_first = (idx < block.first_n);
+            bool in_last = (idx > last - block.last_n);
+
+            return (in_first || in_last);
+        }
+    }
+
+    return false;
+}
+
+// Legacy logic for backward compatibility
+static bool should_upcast_layer_legacy(const std::string& name) {
+    const UpcastStyle style = get_upcast_style();
+    if (style == UpcastStyle::Off) return false;
+
+    if (name.find("norm") != std::string::npos ||
+        name.find("bias") != std::string::npos) {
+        return false;
+    }
+
+    if (name.size() < 7 || name.rfind(".weight") != name.size() - 7) {
+        return false;
+    }
+
     constexpr const char *DOUBLE_PREFIX   = "double_blocks.";
     constexpr const char *SINGLE_PREFIX   = "single_blocks.";
     constexpr const char *GENERIC_PREFIX  = "transformer_blocks.";
@@ -18738,44 +18831,53 @@ static bool should_upcast_layer(const std::string &name) {
     constexpr size_t GENERIC_PREFIX_LEN   = sizeof("transformer_blocks.") - 1;
 
     const UpcastCounts counts = get_upcast_counts();
-
     int idx = -1;
 
-    // double_blocks.*
     if (parse_index_after_prefix(name, DOUBLE_PREFIX, DOUBLE_PREFIX_LEN, idx)) {
         if (style == UpcastStyle::FirstLast) {
             return (idx == 0 || idx == counts.double_last);
         }
-        // Preserve your existing behavior (0 and 7) for non-FirstLast styles
         return (idx == 0 || idx == 7);
     }
 
-    // single_blocks.*
     if (parse_index_after_prefix(name, SINGLE_PREFIX, SINGLE_PREFIX_LEN, idx)) {
         if (style == UpcastStyle::Original) {
             return (idx == 0 || idx == 1 || idx == 46 || idx == 47);
         } else if (style == UpcastStyle::Extended) {
             return (idx == 2 || idx == 6 || idx == 10 || idx == 29 ||
                     idx == 44 || idx == 45 || idx == 46 || idx == 47);
-        } else { // FirstLast
+        } else {
             const int last = counts.single_last;
             const int last_m1 = std::max(0, last - 1);
             return (idx == 0 || idx == 1 || idx == last_m1 || idx == last);
         }
     }
 
-    // transformer_blocks.*
     if (parse_index_after_prefix(name, GENERIC_PREFIX, GENERIC_PREFIX_LEN, idx)) {
         if (style == UpcastStyle::FirstLast) {
             const int last = counts.transformer_last;
             const int last_m1 = std::max(0, last - 1);
             return (idx == 0 || idx == 1 || idx == last_m1 || idx == last);
         }
-        // For Original/Extended, keep transformer_blocks untouched (unless you want otherwise)
         return false;
     }
 
     return false;
+}
+
+// Main entry point
+static bool should_upcast_layer(const std::string& name) {
+    const UpcastConfig& config = get_upcast_config();
+
+    if (!config.enabled) return false;
+
+    // If user provided UPCAST_BLOCKS, use new system exclusively
+    if (config.user_override) {
+        return should_upcast_layer_user(name);
+    }
+
+    // Otherwise, fall back to legacy logic
+    return should_upcast_layer_legacy(name);
 }
 
 static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
@@ -18903,9 +19005,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
     }
 
-    UpcastCounts inferred = get_upcast_counts_fallback();
-    LLAMA_LOG_INFO("DBG UPCAST_STYLE=%d\n", (int)get_upcast_style());
-
+    UpcastCounts inferred = {-1, -1, -1};
 
     for (int i = 0; i < ml.n_tensors; ++i) {
         const struct ggml_tensor * meta = ml.get_tensor_meta(i);
@@ -18921,22 +19021,35 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             qs.has_output = true;
         }
 
-        // NEW: infer block last indices from names
+        // Infer block last indices from names
         int idx = -1;
-        if (parse_index_after_prefix(name, "double_blocks.",      sizeof("double_blocks.")      - 1, idx)) {
+        if (parse_index_after_prefix(name, "double_blocks.", sizeof("double_blocks.") - 1, idx)) {
             inferred.double_last = std::max(inferred.double_last, idx);
-        } else if (parse_index_after_prefix(name, "single_blocks.", sizeof("single_blocks.")     - 1, idx)) {
+        } else if (parse_index_after_prefix(name, "single_blocks.", sizeof("single_blocks.") - 1, idx)) {
             inferred.single_last = std::max(inferred.single_last, idx);
         } else if (parse_index_after_prefix(name, "transformer_blocks.", sizeof("transformer_blocks.") - 1, idx)) {
             inferred.transformer_last = std::max(inferred.transformer_last, idx);
         }
+
+        // Update user-defined block indices
+        update_block_last_indices(name);
     }
 
-    // Cache for should_upcast_layer() during this quantization run
+    // Cache legacy counts
     set_upcast_counts(inferred);
 
-    LLAMA_LOG_INFO("Upcast inferred last indices: double=%d single=%d transformer=%d\n",
-        inferred.double_last, inferred.single_last, inferred.transformer_last);
+    // Log configuration
+    const UpcastConfig& upcast_cfg = get_upcast_config();
+    if (upcast_cfg.user_override) {
+        LLAMA_LOG_INFO("Upcast user-defined blocks:\n");
+        for (const auto& block : upcast_cfg.blocks) {
+            LLAMA_LOG_INFO("  %s first=%d last=%d (last_idx=%d)\n",
+                block.prefix.c_str(), block.first_n, block.last_n, block.last_idx);
+        }
+    } else {
+        LLAMA_LOG_INFO("Upcast legacy mode (UPCAST_STYLE=%d): double=%d single=%d transformer=%d\n",
+            (int)get_upcast_style(), inferred.double_last, inferred.single_last, inferred.transformer_last);
+    }
 
 
 
