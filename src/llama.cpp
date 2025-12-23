@@ -18642,7 +18642,78 @@ static bool parse_index_after_prefix(
     return true;
 }
 
+// Parse llama_ftype from string (e.g., "Q3_K_M" -> LLAMA_FTYPE_MOSTLY_Q3_K_M)
+// Returns LLAMA_FTYPE_ALL_F32 as sentinel for "not specified" or invalid
+static llama_ftype parse_llama_ftype(const std::string& s) {
+    // Normalize: uppercase
+    std::string normalized;
+    normalized.reserve(s.size());
+    for (char c : s) normalized += (char)std::toupper((unsigned char)c);
+
+    // Strip common prefixes
+    if (normalized.rfind("LLAMA_FTYPE_MOSTLY_", 0) == 0) {
+        normalized = normalized.substr(19);
+    } else if (normalized.rfind("LLAMA_FTYPE_", 0) == 0) {
+        normalized = normalized.substr(12);
+    }
+
+    // K-quant variants with _S, _M, _L
+    if (normalized == "Q2_K_S")  return LLAMA_FTYPE_MOSTLY_Q2_K_S;
+    if (normalized == "Q2_K")    return LLAMA_FTYPE_MOSTLY_Q2_K;
+    if (normalized == "Q3_K_S")  return LLAMA_FTYPE_MOSTLY_Q3_K_S;
+    if (normalized == "Q3_K_M")  return LLAMA_FTYPE_MOSTLY_Q3_K_M;
+    if (normalized == "Q3_K_L")  return LLAMA_FTYPE_MOSTLY_Q3_K_L;
+    if (normalized == "Q4_K_S")  return LLAMA_FTYPE_MOSTLY_Q4_K_S;
+    if (normalized == "Q4_K_M")  return LLAMA_FTYPE_MOSTLY_Q4_K_M;
+    if (normalized == "Q5_K_S")  return LLAMA_FTYPE_MOSTLY_Q5_K_S;
+    if (normalized == "Q5_K_M")  return LLAMA_FTYPE_MOSTLY_Q5_K_M;
+    if (normalized == "Q6_K")    return LLAMA_FTYPE_MOSTLY_Q6_K;
+
+    // Basic types
+    if (normalized == "Q4_0")    return LLAMA_FTYPE_MOSTLY_Q4_0;
+    if (normalized == "Q4_1")    return LLAMA_FTYPE_MOSTLY_Q4_1;
+    if (normalized == "Q5_0")    return LLAMA_FTYPE_MOSTLY_Q5_0;
+    if (normalized == "Q5_1")    return LLAMA_FTYPE_MOSTLY_Q5_1;
+    if (normalized == "Q8_0")    return LLAMA_FTYPE_MOSTLY_Q8_0;
+    if (normalized == "F16")     return LLAMA_FTYPE_MOSTLY_F16;
+    if (normalized == "BF16")    return LLAMA_FTYPE_MOSTLY_BF16;
+    if (normalized == "F32")     return LLAMA_FTYPE_ALL_F32;
+
+    // IQ types
+    if (normalized == "IQ2_XXS") return LLAMA_FTYPE_MOSTLY_IQ2_XXS;
+    if (normalized == "IQ2_XS")  return LLAMA_FTYPE_MOSTLY_IQ2_XS;
+    if (normalized == "IQ2_S")   return LLAMA_FTYPE_MOSTLY_IQ2_S;
+    if (normalized == "IQ2_M")   return LLAMA_FTYPE_MOSTLY_IQ2_M;
+    if (normalized == "IQ3_XXS") return LLAMA_FTYPE_MOSTLY_IQ3_XXS;
+    if (normalized == "IQ3_XS")  return LLAMA_FTYPE_MOSTLY_IQ3_XS;
+    if (normalized == "IQ3_S")   return LLAMA_FTYPE_MOSTLY_IQ3_S;
+    if (normalized == "IQ3_M")   return LLAMA_FTYPE_MOSTLY_IQ3_M;
+    if (normalized == "IQ4_NL")  return LLAMA_FTYPE_MOSTLY_IQ4_NL;
+    if (normalized == "IQ4_XS")  return LLAMA_FTYPE_MOSTLY_IQ4_XS;
+    if (normalized == "IQ1_S")   return LLAMA_FTYPE_MOSTLY_IQ1_S;
+    if (normalized == "IQ1_M")   return LLAMA_FTYPE_MOSTLY_IQ1_M;
+
+    return (llama_ftype)-1; // Invalid sentinel
+}
+
+// Check if string represents an ftype variant (has _S, _M, _L suffix for K-quants)
+static bool is_ftype_variant(const std::string& s) {
+    std::string normalized;
+    for (char c : s) normalized += (char)std::toupper((unsigned char)c);
+    
+    // K-quant variants
+    if (normalized.find("_K_S") != std::string::npos) return true;
+    if (normalized.find("_K_M") != std::string::npos) return true;
+    if (normalized.find("_K_L") != std::string::npos) return true;
+    
+    // IQ variants with _S, _M, _XS, _XXS
+    if (normalized.find("IQ") == 0) return true;
+    
+    return false;
+}
+
 // Parse ggml_type from string (e.g., "Q4_K" -> GGML_TYPE_Q4_K)
+// For ftype variants like Q3_K_M, returns the base type (Q3_K)
 static ggml_type parse_ggml_type(const std::string& s) {
     // Normalize: uppercase
     std::string normalized;
@@ -18650,9 +18721,18 @@ static ggml_type parse_ggml_type(const std::string& s) {
     for (char c : s) normalized += (char)std::toupper((unsigned char)c);
 
     // Strip common prefixes
-    const char* prefix = "GGML_TYPE_";
-    if (normalized.rfind(prefix, 0) == 0) {
-        normalized = normalized.substr(std::strlen(prefix));
+    if (normalized.rfind("GGML_TYPE_", 0) == 0) {
+        normalized = normalized.substr(10);
+    }
+
+    // Handle _M, _S, _L variants by stripping suffix
+    // Q3_K_M -> Q3_K, Q4_K_S -> Q4_K, etc.
+    for (const char* suffix : {"_S", "_M", "_L"}) {
+        size_t pos = normalized.rfind(suffix);
+        if (pos != std::string::npos && pos == normalized.size() - 2) {
+            normalized = normalized.substr(0, pos);
+            break;
+        }
     }
 
     // Map strings to types
@@ -18669,9 +18749,28 @@ static ggml_type parse_ggml_type(const std::string& s) {
     if (normalized == "F16")   return GGML_TYPE_F16;
     if (normalized == "BF16")  return GGML_TYPE_BF16;
     if (normalized == "F32")   return GGML_TYPE_F32;
+    
+    // IQ types
+    if (normalized == "IQ2_XXS") return GGML_TYPE_IQ2_XXS;
+    if (normalized == "IQ2_XS")  return GGML_TYPE_IQ2_XS;
+    if (normalized == "IQ2_S")   return GGML_TYPE_IQ2_S;
+    if (normalized == "IQ3_XXS") return GGML_TYPE_IQ3_XXS;
+    if (normalized == "IQ3_S")   return GGML_TYPE_IQ3_S;
+    if (normalized == "IQ4_NL")  return GGML_TYPE_IQ4_NL;
+    if (normalized == "IQ4_XS")  return GGML_TYPE_IQ4_XS;
+    if (normalized == "IQ1_S")   return GGML_TYPE_IQ1_S;
+    if (normalized == "IQ1_M")   return GGML_TYPE_IQ1_M;
 
     return GGML_TYPE_COUNT; // Invalid/not found
 }
+
+// Result of upcast check - contains both whether to upcast and what type
+struct UpcastResult {
+    bool should_upcast = false;
+    ggml_type target_type = GGML_TYPE_COUNT; // COUNT means use default upcast logic
+    llama_ftype target_ftype = (llama_ftype)-1; // -1 means not specified
+    bool use_ftype = false; // true if user specified _M/_S/_L variant
+};
 
 // Parse a list of integers: "0,5,10-15,47" -> {0, 5, 10, 11, 12, 13, 14, 15, 47}
 static std::unordered_set<int> parse_index_list(const std::string& s) {
@@ -18720,18 +18819,20 @@ static std::unordered_set<int> parse_index_list(const std::string& s) {
 // Extended upcast rule supporting exact keys, specific indices, and custom types
 struct UpcastRule {
     enum class Type {
-        ExactKey,       // Match exact tensor name
-        BlockIndices,   // Match specific block indices
-        BlockFirstLast  // Match first N / last N blocks (original behavior)
+        ExactKey,
+        BlockIndices,
+        BlockFirstLast
     };
 
     Type rule_type = Type::BlockFirstLast;
-    std::string pattern;                    // Exact key or block prefix
-    std::unordered_set<int> indices;        // For BlockIndices: specific indices
-    int first_n = 0;                        // For BlockFirstLast
-    int last_n = 0;                         // For BlockFirstLast
-    int last_idx = -1;                      // Discovered last index (for BlockFirstLast)
-    ggml_type target_type = GGML_TYPE_COUNT; // COUNT = use default upcast logic
+    std::string pattern;
+    std::unordered_set<int> indices;
+    int first_n = 0;
+    int last_n = 0;
+    int last_idx = -1;
+    ggml_type target_type = GGML_TYPE_COUNT;
+    llama_ftype target_ftype = (llama_ftype)-1;
+    bool use_ftype = false;
 };
 
 // Global configuration
@@ -18745,9 +18846,9 @@ struct UpcastConfig {
 static UpcastConfig g_upcast_config;
 static std::atomic<bool> g_upcast_config_parsed{false};
 
-// Parse extended format:
+// Parse extended upcast rule format:
 //   "exact.tensor.name=Q6_K"           -> ExactKey with target type
-//   "single_blocks[0,5,10,47]=Q5_K"    -> BlockIndices with specific indices and type
+//   "single_blocks[0,5,10,47]=Q5_K_M"  -> BlockIndices with specific indices and ftype
 //   "single_blocks[0,5,10,47]"         -> BlockIndices with default upcast
 //   "single_blocks:2:2:Q6_K"           -> BlockFirstLast with type
 //   "single_blocks:2:2"                -> BlockFirstLast with default upcast (backward compat)
@@ -18755,10 +18856,22 @@ static std::atomic<bool> g_upcast_config_parsed{false};
 static bool parse_upcast_rule(const std::string& spec, UpcastRule& out) {
     out = UpcastRule{}; // Reset
 
+    // Helper to parse type string and set rule's type fields
+    auto parse_type_spec = [](const std::string& type_str, UpcastRule& rule) {
+        if (is_ftype_variant(type_str)) {
+            rule.use_ftype = true;
+            rule.target_ftype = parse_llama_ftype(type_str);
+            rule.target_type = parse_ggml_type(type_str); // base type
+        } else {
+            rule.use_ftype = false;
+            rule.target_type = parse_ggml_type(type_str);
+        }
+    };
+
     std::string trimmed = spec;
     // Trim whitespace
-    size_t start = trimmed.find_first_not_of(" \t");
-    size_t end = trimmed.find_last_not_of(" \t");
+    size_t start = trimmed.find_first_not_of(" \t\n\r");
+    size_t end = trimmed.find_last_not_of(" \t\n\r");
     if (start == std::string::npos) return false;
     trimmed = trimmed.substr(start, end - start + 1);
 
@@ -18787,7 +18900,7 @@ static bool parse_upcast_rule(const std::string& spec, UpcastRule& out) {
             // Exact key match
             out.rule_type = UpcastRule::Type::ExactKey;
             out.pattern = key_part;
-            out.target_type = parse_ggml_type(type_part);
+            parse_type_spec(type_part, out);
             return !out.pattern.empty();
         }
     }
@@ -18818,7 +18931,7 @@ static bool parse_upcast_rule(const std::string& spec, UpcastRule& out) {
                 end = type_str.find_last_not_of(" \t");
                 if (start != std::string::npos) {
                     type_str = type_str.substr(start, end - start + 1);
-                    out.target_type = parse_ggml_type(type_str);
+                    parse_type_spec(type_str, out);
                 }
             }
         }
@@ -18853,7 +18966,7 @@ static bool parse_upcast_rule(const std::string& spec, UpcastRule& out) {
         // Try to parse as type first
         ggml_type maybe_type = parse_ggml_type(parts[i]);
         if (maybe_type != GGML_TYPE_COUNT) {
-            out.target_type = maybe_type;
+            parse_type_spec(parts[i], out);
         } else {
             // Try to parse as number
             bool is_num = !parts[i].empty();
@@ -18991,11 +19104,6 @@ static UpcastCounts get_upcast_counts() {
     return UpcastCounts{7, 47, 51};
 }
 
-// Result of upcast check - contains both whether to upcast and what type
-struct UpcastResult {
-    bool should_upcast = false;
-    ggml_type target_type = GGML_TYPE_COUNT; // COUNT means use default upcast logic
-};
 
 // Check if layer should be upcast using new config system
 static UpcastResult check_upcast_user(const std::string& name) {
@@ -19004,68 +19112,66 @@ static UpcastResult check_upcast_user(const std::string& name) {
 
     if (!config.enabled || config.rules.empty()) return result;
 
-    // Skip norms and biases
     if (name.find("norm") != std::string::npos ||
         name.find("bias") != std::string::npos) {
         return result;
     }
 
-    // Must end with ".weight" (for block rules, not exact keys)
     bool ends_with_weight = (name.size() >= 7 && name.rfind(".weight") == name.size() - 7);
 
-    // Check exact key match first (fast path)
     auto exact_it = config.exact_keys.find(name);
     if (exact_it != config.exact_keys.end()) {
         result.should_upcast = true;
         result.target_type = exact_it->second;
+        // Note: exact_keys doesn't store ftype info, find the rule for full info
+        for (const auto& rule : config.rules) {
+            if (rule.rule_type == UpcastRule::Type::ExactKey && rule.pattern == name) {
+                result.use_ftype = rule.use_ftype;
+                result.target_ftype = rule.target_ftype;
+                break;
+            }
+        }
         return result;
     }
 
-    // Check rules in order (first match wins)
     for (const auto& rule : config.rules) {
+        bool matched = false;
+        
         switch (rule.rule_type) {
             case UpcastRule::Type::ExactKey:
-                // Already checked via exact_keys map
-                if (rule.pattern == name) {
-                    result.should_upcast = true;
-                    result.target_type = rule.target_type;
-                    return result;
-                }
+                if (rule.pattern == name) matched = true;
                 break;
 
             case UpcastRule::Type::BlockIndices: {
                 if (!ends_with_weight) break;
-
                 int idx = -1;
                 if (parse_index_after_prefix(name, rule.pattern.c_str(), rule.pattern.size(), idx)) {
-                    if (rule.indices.count(idx) > 0) {
-                        result.should_upcast = true;
-                        result.target_type = rule.target_type;
-                        return result;
-                    }
+                    if (rule.indices.count(idx) > 0) matched = true;
                 }
                 break;
             }
 
             case UpcastRule::Type::BlockFirstLast: {
                 if (!ends_with_weight) break;
-
                 int idx = -1;
                 if (parse_index_after_prefix(name, rule.pattern.c_str(), rule.pattern.size(), idx)) {
                     const int last = rule.last_idx;
-                    if (last < 0) break;
-
-                    bool in_first = (idx < rule.first_n);
-                    bool in_last = (idx > last - rule.last_n);
-
-                    if (in_first || in_last) {
-                        result.should_upcast = true;
-                        result.target_type = rule.target_type;
-                        return result;
+                    if (last >= 0) {
+                        bool in_first = (idx < rule.first_n);
+                        bool in_last = (idx > last - rule.last_n);
+                        if (in_first || in_last) matched = true;
                     }
                 }
                 break;
             }
+        }
+
+        if (matched) {
+            result.should_upcast = true;
+            result.target_type = rule.target_type;
+            result.target_ftype = rule.target_ftype;
+            result.use_ftype = rule.use_ftype;
+            return result;
         }
     }
 
@@ -19693,32 +19799,43 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             }
             }
 
-            // Upcast specific layers for K-quants (but never downgrade a better per-tensor choice)
-	    {
-		UpcastResult upcast = get_upcast_result(name);
+            // Upcast specific layers (with optional custom target type or ftype)
+            {
+                UpcastResult upcast_result = get_upcast_result(name);
 
-		if (upcast.should_upcast) {
-		    ggml_type final_type;
+                if (upcast_result.should_upcast) {
+                    ggml_type final_type;
 
-		    if (upcast.target_type != GGML_TYPE_COUNT) {
-			// User specified exact type
-			final_type = upcast.target_type;
-		    } else if (is_k_quant(default_type) && is_k_quant(new_type)) {
-			// Use default upcast logic
-			const ggml_type upcast_candidate = get_upcast_type(default_type);
-			final_type = k_quant_max(new_type, upcast_candidate);
-		    } else {
-			final_type = new_type;
-		    }
+                    if (upcast_result.use_ftype && upcast_result.target_ftype != (llama_ftype)-1) {
+                        // User specified ftype variant (e.g., Q3_K_M) - apply per-tensor logic
+                        ggml_type base_type = upcast_result.target_type;
+                        if (base_type == GGML_TYPE_COUNT) {
+                            base_type = default_type;
+                        }
+                        
+                        if (image_model) {
+                            final_type = img_tensor_get_type(qs, base_type, tensor, upcast_result.target_ftype);
+                        } else {
+                            final_type = llama_tensor_get_type(qs, base_type, tensor, upcast_result.target_ftype);
+                        }
+                    } else if (upcast_result.target_type != GGML_TYPE_COUNT) {
+                        // User specified exact ggml_type
+                        final_type = upcast_result.target_type;
+                    } else if (is_k_quant(default_type) && is_k_quant(new_type)) {
+                        // Use default upcast logic
+                        const ggml_type upcast_candidate = get_upcast_type(default_type);
+                        final_type = k_quant_max(new_type, upcast_candidate);
+                    } else {
+                        final_type = new_type;
+                    }
 
-		    if (final_type != new_type) {
-			LLAMA_LOG_INFO("(upcast %s -> %s) ",
-			    ggml_type_name(new_type), ggml_type_name(final_type));
-			new_type = final_type;
-		    }
-		}
-	    }
-
+                    if (final_type != new_type) {
+                        LLAMA_LOG_INFO("(upcast %s -> %s) ",
+                            ggml_type_name(new_type), ggml_type_name(final_type));
+                        new_type = final_type;
+                    }
+                }
+            }
             
             // If we've decided to quantize to the same type the tensor is already
             // in then there's nothing to do.
